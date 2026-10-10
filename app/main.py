@@ -108,43 +108,93 @@ def get_employee(emp_code: str) -> dict:
     return employee
 
 
-def calculate_attendance(employee: dict, day: date,
-                         punch_in_ms: int, punch_out_ms: Optional[int]):
-    punch_in = from_epoch_ms(punch_in_ms)
-    punch_out = from_epoch_ms(punch_out_ms)
 
-    shift_start = shift_datetime(day, employee["shift_start"])
-    shift_end = shift_datetime(day, employee["shift_end"])
+def calculate_attendance(
+    emp: dict,
+    punch_in_ms: int,
+    punch_out_ms: int | None = None,
+) -> dict:
+    from datetime import datetime, timedelta, timezone
+    from decimal import Decimal, ROUND_HALF_UP
 
-    # Compare instants in UTC; shift boundaries are interpreted in IST.
-    late_minutes = max(
-        0, int((punch_in - shift_start.astimezone(timezone.utc)).total_seconds() // 60)
+    IST = timezone(timedelta(hours=5, minutes=30))
+
+    def round2(value: float) -> float:
+        return float(
+            Decimal(str(value)).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+        )
+
+    # Convert epoch milliseconds to IST
+    punch_in_utc = datetime.fromtimestamp(
+        punch_in_ms / 1000, tz=timezone.utc
+    )
+    punch_in_ist = punch_in_utc.astimezone(IST)
+
+    # Shift times are interpreted in IST
+    shift_start_time = datetime.strptime(
+        emp["shift_start"], "%H:%M"
+    ).time()
+    shift_end_time = datetime.strptime(
+        emp["shift_end"], "%H:%M"
+    ).time()
+
+    shift_start = datetime.combine(
+        punch_in_ist.date(), shift_start_time, tzinfo=IST
+    )
+    shift_end = datetime.combine(
+        punch_in_ist.date(), shift_end_time, tzinfo=IST
     )
 
-    work_hours = None
-    overtime_hours = 0.0
-    status = "present"
+    # Handle overnight shifts
+    if shift_end <= shift_start:
+        shift_end += timedelta(days=1)
 
-    if punch_out:
-        seconds = max(0, (punch_out - punch_in).total_seconds())
-        work_hours = round_hours(seconds / 3600)
+    late_minutes = max(
+        0,
+        int((punch_in_ist - shift_start).total_seconds() // 60),
+    )
+
+    # Ten-minute grace applies to late classification.
+    is_late = late_minutes > 10
+
+    work_hours = None
+    overtime_minutes = 0
+    half_day = False
+
+    if punch_out_ms is not None:
+        punch_out_utc = datetime.fromtimestamp(
+            punch_out_ms / 1000, tz=timezone.utc
+        )
+        punch_out_ist = punch_out_utc.astimezone(IST)
+
+        # If the punch-in belongs to an overnight shift,
+        # the shift end is already on the following day.
+        elapsed_seconds = max(
+            0,
+            (punch_out_ist - punch_in_ist).total_seconds(),
+        )
+        work_hours = round2(elapsed_seconds / 3600)
+
         overtime_seconds = max(
             0,
-            (punch_out - shift_end.astimezone(timezone.utc)).total_seconds(),
+            (punch_out_ist - shift_end).total_seconds(),
         )
-        overtime_hours = (
-            round_hours(overtime_seconds / 3600)
-            if overtime_seconds >= 30 * 60 else 0.0
-        )
-        if work_hours < 4.50:
-            status = "half_day"
+        if overtime_seconds >= 30 * 60:
+            overtime_minutes = int(overtime_seconds // 60)
+
+        half_day = work_hours < 4.50
 
     return {
         "late_minutes": late_minutes,
+        "is_late": is_late,
         "work_hours": work_hours,
-        "overtime_hours": overtime_hours,
-        "status": status,
+        "overtime_minutes": overtime_minutes,
+        "half_day": half_day,
     }
+
 
 
 def working_days_between(start: date, end: date) -> int:
