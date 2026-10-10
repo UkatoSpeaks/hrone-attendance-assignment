@@ -26,7 +26,7 @@ client = MongoClient(
 )
 db = client[MONGO_DB]
 employees = db["employees"]
-attendance = db["attendance"]
+attendance = db["attendance_logs"]
 audit_logs = db["audit_logs"]
 
 app = FastAPI(title="HROne Attendance & Analytics API", version="1.0.0")
