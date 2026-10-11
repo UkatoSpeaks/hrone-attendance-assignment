@@ -5,6 +5,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal, Optional
 
+from bson.decimal128 import Decimal128
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -52,7 +54,11 @@ PRESENCE_STATUSES = ("PRESENT", "WFH", "ON_DUTY")
 def create_indexes():
     client.admin.command("ping")
     employees.create_index([("emp_code", ASCENDING)], unique=True)
-    employees.create_index([("department", ASCENDING)])
+    # Employee list filtered by department, already in emp_code order.
+    employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
+    # Headcount: who had joined by a given day, overall or in one department.
+    employees.create_index([("joined_on", ASCENDING)])
+    employees.create_index([("department", ASCENDING), ("joined_on", ASCENDING)])
     attendance.create_index(
         [("emp_code", ASCENDING), ("date", ASCENDING)],
         unique=True,
@@ -712,39 +718,107 @@ def employee_monthly_analytics(
 
 # -------------------- DEPARTMENT SUMMARY --------------------
 
-@app.get("/analytics/departments/summary")
-def department_summary():
-    today = now_utc().astimezone(
-        timezone(timedelta(hours=5, minutes=30))
-    ).date().isoformat()
+def department_summary_pipeline(
+    month_start: date,
+    next_month: date,
+    department: Optional[str] = None,
+) -> list:
+    """Runs on `employees`, not on the logs.
 
-    employee_counts = list(employees.aggregate([
-        {"$group": {"_id": "$department", "headcount": {"$sum": 1}}}
-    ]))
-    daily = list(attendance.aggregate([
-        {"$match": {"date": today}},
+    Starting from the employees is what keeps people with zero logs in the
+    headcount: every employee produces a row, and their month of logs (possibly
+    none) is attached to it.
+    """
+    month_end = next_month - timedelta(days=1)
+
+    # R9: everyone who had joined by the last day of the month.
+    employee_filter = {"joined_on": {"$lte": month_end.isoformat()}}
+    if department:
+        employee_filter["department"] = department
+
+    # The average only looks at present records that have hours recorded.
+    has_work_hours = {"$and": [IS_PRESENT, {"$isNumber": "$work_hours"}]}
+
+    one_employee_month = [
+        {"$match": {
+            "date": {"$gte": month_start.isoformat(), "$lt": next_month.isoformat()},
+        }},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": {
+                "$cond": [{"$and": [IS_PRESENT, IS_WEEKDAY]}, PRESENT_DAY_VALUE, 0]
+            }},
+            # Hours are added up as exact decimals, so the average is not
+            # thrown off by floating-point error before it gets rounded.
+            "work_hours_total": {"$sum": {
+                "$cond": [has_work_hours, {"$toDecimal": "$work_hours"}, 0]
+            }},
+            "work_hours_records": count_if(has_work_hours),
+            "late_count": count_if(IS_LATE),
+            "total_late_minutes": {"$sum": "$late_minutes"},
+            "leave_count": count_if({"$eq": ["$status", "LEAVE"]}),
+            "on_duty_count": count_if({"$eq": ["$status", "ON_DUTY"]}),
+        }},
+    ]
+
+    return [
+        {"$match": employee_filter},
+        {"$lookup": {
+            "from": attendance.name,
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": one_employee_month,
+            "as": "logs",
+        }},
+        # Keep the employee even when the lookup found nothing.
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
         {"$group": {
             "_id": "$department",
-            "present": {"$sum": 1},
-            "late": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
-            "total_late_minutes": {"$sum": "$late_minutes"},
-            "total_work_hours": {"$sum": {"$ifNull": ["$work_hours", 0]}},
+            "headcount": {"$sum": 1},
+            "present_days": {"$sum": "$logs.present_days"},
+            # Totals and record counts are summed across the department, so the
+            # average is over records, not an average of each person's average.
+            "work_hours_total": {"$sum": "$logs.work_hours_total"},
+            "work_hours_records": {"$sum": "$logs.work_hours_records"},
+            "late_count": {"$sum": "$logs.late_count"},
+            "total_late_minutes": {"$sum": "$logs.total_late_minutes"},
+            "leave_count": {"$sum": "$logs.leave_count"},
+            "on_duty_count": {"$sum": "$logs.on_duty_count"},
         }},
-    ]))
-    daily_map = {item["_id"]: item for item in daily}
-    result = []
-    for item in employee_counts:
-        department = item["_id"]
-        day_data = daily_map.get(department, {})
-        result.append({
-            "department": department,
-            "headcount": item["headcount"],
-            "present": day_data.get("present", 0),
-            "late": day_data.get("late", 0),
-            "total_late_minutes": day_data.get("total_late_minutes", 0),
-            "total_work_hours": day_data.get("total_work_hours", 0),
+        {"$sort": {"_id": 1}},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+):
+    month_start, next_month = month_bounds(month)
+    pipeline = department_summary_pipeline(month_start, next_month, department)
+
+    items = []
+    for row in employees.aggregate(pipeline):
+        avg_work_hours = None
+        if row["work_hours_records"] > 0:
+            total = row["work_hours_total"]
+            if isinstance(total, Decimal128):
+                total = total.to_decimal()
+            avg_work_hours = round_half_up(
+                Decimal(str(total)) / row["work_hours_records"]
+            )
+
+        items.append({
+            "department": row["_id"],
+            "headcount": int(row["headcount"]),
+            "present_days": row["present_days"],
+            "avg_work_hours": avg_work_hours,
+            "late_count": int(row["late_count"]),
+            "total_late_minutes": int(row["total_late_minutes"]),
+            "leave_count": int(row["leave_count"]),
+            "on_duty_count": int(row["on_duty_count"]),
         })
-    return {"date": today, "departments": sorted(result, key=lambda x: x["department"] or "")}
+    return {"month": month, "items": items}
 
 
 # -------------------- LATE ARRIVAL LEADERBOARD --------------------
