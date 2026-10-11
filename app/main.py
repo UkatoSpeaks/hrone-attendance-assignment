@@ -1,10 +1,12 @@
 
+import json
 import os
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from bson.decimal128 import Decimal128
 
 from dotenv import load_dotenv
@@ -893,112 +895,252 @@ def late_leaderboard(
 
 # -------------------- DEPARTMENT DAILY TREND --------------------
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(
-    department: str,
-    date_from: str,
-    date_to: str,
-):
+MAX_TREND_DAYS = 92
+
+# Rates are worked out as whole ten-thousandths (0.3333 is kept as 3333),
+# so rounding to 4 decimals is exact integer arithmetic.
+RATE_SCALE = 10000
+
+
+def rounded_division(numerator, denominator) -> dict:
+    """numerator / denominator, rounded half-up to a whole number, inside MongoDB.
+
+    MongoDB's own $round sends halves to the nearest even number, which is not
+    what R8 asks for. floor((2n + d) / 2d) gives half-up, and stays exact
+    because both sides are whole numbers.
+    """
+    return {"$floor": {"$divide": [
+        {"$add": [{"$multiply": [2, numerator]}, denominator]},
+        {"$multiply": [2, denominator]},
+    ]}}
+
+
+def department_trend_pipeline(department: str, start: date, end: date) -> list:
+    """Runs on `employees`: the department lives there, not on the logs.
+
+    Every employee is turned into a handful of small "events" (they joined on
+    this day, they were present on that day, ...). Grouping the events by day
+    gives the days that have something on them; $densify then adds the days
+    that have nothing, so there is exactly one row per calendar day.
+    """
+    first_day = start.isoformat()
+    last_day = end.isoformat()
+
+    logs_in_range = [
+        {"$match": {"date": {"$gte": first_day, "$lte": last_day}}},
+        {"$project": {
+            "_id": 0,
+            "day": "$date",
+            # Any day of the week counts here, weekends included.
+            "present": {"$cond": [IS_PRESENT, PRESENT_DAY_VALUE, 0]},
+            "late": {"$cond": [IS_LATE, 1, 0]},
+        }},
+    ]
+
+    # Someone who joined before the range is counted from its first day;
+    # someone who joins after the range is not counted at all (R9).
+    join_event = {"$cond": [
+        {"$lte": ["$joined_on", last_day]},
+        [{"day": {"$max": ["$joined_on", first_day]}, "joined": 1}],
+        [],
+    ]}
+
+    return [
+        {"$match": {"department": department}},
+        {"$lookup": {
+            "from": attendance.name,
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": logs_in_range,
+            "as": "logs",
+        }},
+        {"$project": {
+            "events": {"$concatArrays": [
+                # Two empty events pin down both ends of the range, so the
+                # gap filling below always covers first_day..last_day.
+                [{"day": first_day}, {"day": last_day}],
+                join_event,
+                "$logs",
+            ]},
+        }},
+        {"$unwind": "$events"},
+        {"$group": {
+            "_id": "$events.day",
+            "joined": {"$sum": "$events.joined"},
+            "present_count": {"$sum": "$events.present"},
+            "late_count": {"$sum": "$events.late"},
+        }},
+        # $densify needs a real date, not the "YYYY-MM-DD" text.
+        {"$set": {"day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d"}}}},
+        {"$densify": {
+            "field": "day",
+            "range": {"step": 1, "unit": "day", "bounds": "full"},
+        }},
+        # Headcount on a day = everyone who has joined up to and including that day.
+        {"$setWindowFields": {
+            "sortBy": {"day": 1},
+            "output": {
+                "headcount": {
+                    "$sum": "$joined",
+                    "window": {"documents": ["unbounded", "current"]},
+                },
+            },
+        }},
+        {"$set": {
+            "is_working_day": {"$lte": [{"$isoDayOfWeek": "$day"}, 5]},
+            # Days added by $densify have no counts yet.
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+        }},
+        {"$set": {
+            # Only a working day with people on the books has a rate.
+            # A working day nobody showed up on is 0, not null.
+            "rate": {"$cond": [
+                {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                rounded_division(
+                    {"$multiply": ["$present_count", RATE_SCALE]}, "$headcount"
+                ),
+                None,
+            ]},
+        }},
+        # 7-day moving average: this row and up to 6 rows before it. The window
+        # counts rows, so weekends take up a slot but add nothing, and the
+        # first rows of the range simply have fewer rows to look back on.
+        {"$setWindowFields": {
+            "sortBy": {"day": 1},
+            "output": {
+                "rate_total": {"$sum": "$rate", "window": {"documents": [-6, 0]}},
+                "rate_days": {
+                    "$sum": {"$cond": [{"$eq": ["$rate", None]}, 0, 1]},
+                    "window": {"documents": [-6, 0]},
+                },
+            },
+        }},
+        {"$sort": {"day": 1}},
+        {"$project": {
+            "_id": 0,
+            "date": {"$dateToString": {"date": "$day", "format": "%Y-%m-%d"}},
+            "is_working_day": 1,
+            "headcount": 1,
+            "present_count": 1,
+            "late_count": 1,
+            "attendance_rate": {"$cond": [
+                {"$eq": ["$rate", None]},
+                None,
+                {"$divide": ["$rate", RATE_SCALE]},
+            ]},
+            "moving_avg_7d": {"$cond": [
+                {"$gt": ["$rate_days", 0]},
+                {"$divide": [rounded_division("$rate_total", "$rate_days"), RATE_SCALE]},
+                None,
+            ]},
+        }},
+    ]
+
+
+def trend_range(date_from: str, date_to: str) -> tuple[date, date]:
     start = parse_date(date_from)
     end = parse_date(date_to)
     if end < start:
-        raise HTTPException(status_code=422, detail="date_to must be on or after date_from")
-    if (end - start).days > 365:
-        raise HTTPException(status_code=422, detail="Date range cannot exceed 366 days")
-
-    pipeline = [
-        {"$match": {
-            "department": department,
-            "date": {"$gte": date_from, "$lte": date_to},
-        }},
-        {"$group": {
-            "_id": "$date",
-            "present": {"$sum": 1},
-            "late": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
-            "work_hours": {"$sum": {"$ifNull": ["$work_hours", 0]}},
-        }},
-        {"$sort": {"_id": 1}},
-    ]
-    by_day = {row["_id"]: row for row in attendance.aggregate(pipeline)}
-    days = []
-    current = start
-    while current <= end:
-        key = current.isoformat()
-        row = by_day.get(key, {})
-        days.append({
-            "date": key,
-            "present": row.get("present", 0),
-            "late": row.get("late", 0),
-            "work_hours": row.get("work_hours", 0),
-        })
-        current += timedelta(days=1)
-
-    for index, row in enumerate(days):
-        window = days[max(0, index - 6):index + 1]
-        row["moving_average_7d"] = round(
-            sum(item["present"] for item in window) / len(window), 2
+        raise HTTPException(status_code=422, detail="to must be on or after from")
+    if (end - start).days + 1 > MAX_TREND_DAYS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Date range cannot exceed {MAX_TREND_DAYS} days",
         )
-    return {"department": department, "items": days}
+    return start, end
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    date_from: str = Query(alias="from"),
+    date_to: str = Query(alias="to"),
+):
+    start, end = trend_range(date_from, date_to)
+    items = list(
+        employees.aggregate(department_trend_pipeline(department, start, end))
+    )
+    # The pipeline starts from the department's employees, so it only comes
+    # back empty when the department has none.
+    if not items:
+        raise HTTPException(status_code=404, detail="Department not found")
+    return {"department": department, "items": items}
 
 
 # -------------------- QUERY EXPLAIN --------------------
 
-@app.get("/admin/explain/{endpoint}")
-def explain_endpoint(endpoint: str):
-    pipelines = {
-        "monthly": [
-            {"$match": {"emp_code": "EMP0001", "date": {"$gte": "2026-01-01", "$lt": "2026-02-01"}}},
-            {"$group": {"_id": "$emp_code", "days": {"$sum": 1}}},
-        ],
-        "department-summary": [
-            {"$match": {"date": "2026-01-01"}},
-            {"$group": {"_id": "$department", "present": {"$sum": 1}}},
-        ],
-        
-"leaderboard": [
-    {
-        "$group": {
-            "_id": "$emp_code",
-            "late_days": {
-                "$sum": {
-                    "$cond": [
-                        {"$gt": ["$late_minutes", 0]},
-                        1,
-                        0,
-                    ]
-                }
-            },
-        }
-    },
-    {"$sort": {"late_days": -1}},
-    {"$limit": 10},
-],
-
-        "trend": [
-            {"$match": {"department": "Engineering", "date": {"$gte": "2026-01-01", "$lte": "2026-01-31"}}},
-            {"$group": {"_id": "$date", "present": {"$sum": 1}}},
-            {"$sort": {"_id": 1}},
-        ],
-    }
-    if endpoint not in pipelines:
+def need(**params):
+    missing = [name for name, value in params.items() if value is None]
+    if missing:
         raise HTTPException(
-            status_code=404,
-            detail="Use monthly, department-summary, leaderboard, or trend",
+            status_code=422,
+            detail="Missing query parameter(s): " + ", ".join(missing),
         )
 
-    try:
-        result = db.command({
-            "explain": {
-                "aggregate": "attendance",
-                "pipeline": pipelines[endpoint],
-                "cursor": {},
-            },
-            "verbosity": "executionStats",
-        })
-        return {
-            "endpoint": endpoint,
-            "executionStats": result.get("executionStats", {}),
-            "queryPlanner": result.get("queryPlanner", {}),
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[AttendanceStatus] = None,
+    trend_from: Optional[str] = Query(None, alias="from"),
+    trend_to: Optional[str] = Query(None, alias="to"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    # Nothing is rebuilt by hand here. Every branch calls the same function
+    # the real endpoint calls, so the plan we show is the plan it really gets.
+    if endpoint == "attendance_list":
+        collection = attendance
+        command = {
+            "find": collection.name,
+            "filter": attendance_list_query(emp_code, date_from, date_to, status),
+            "sort": dict(ATTENDANCE_LIST_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
         }
-    except PyMongoError as exc:
-        raise HTTPException(status_code=500, detail=f"Explain failed: {exc}")
+    else:
+        if endpoint == "employee_monthly":
+            need(emp_code=emp_code, month=month)
+            collection = attendance
+            pipeline = employee_monthly_pipeline(emp_code, *month_bounds(month))
+
+        elif endpoint == "department_summary":
+            need(month=month)
+            collection = employees
+            pipeline = department_summary_pipeline(*month_bounds(month), department)
+
+        elif endpoint == "late_leaderboard":
+            need(month=month)
+            collection = attendance
+            pipeline = late_leaderboard_pipeline(*month_bounds(month), limit, department)
+
+        else:  # department_trend
+            need(department=department, **{"from": trend_from, "to": trend_to})
+            collection = employees
+            start, end = trend_range(trend_from, trend_to)
+            pipeline = department_trend_pipeline(department, start, end)
+
+        command = {"aggregate": collection.name, "pipeline": pipeline, "cursor": {}}
+
+    plan = db.command("explain", command, verbosity="executionStats")
+
+    # The plan carries a few MongoDB-only types (timestamps, binary ids)
+    # that plain JSON can't hold, so let bson write it out first.
+    return {
+        "endpoint": endpoint,
+        "collection": collection.name,
+        "explain": json.loads(json_util.dumps(plan)),
+    }
