@@ -603,47 +603,111 @@ def list_attendance(
 
 # -------------------- MONTHLY EMPLOYEE ANALYTICS --------------------
 
-@app.get("/analytics/employees/{emp_code}/monthly")
-def employee_monthly_analytics(emp_code: str, month: str):
-    employee = get_employee(emp_code)
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+def month_bounds(month: str) -> tuple[date, date]:
+    """First day of the month and first day of the month after it."""
     try:
-        month_start = date.fromisoformat(f"{month}-01")
+        year, month_number = map(int, month.split("-"))
+        first_day = date(year, month_number, 1)
+        if month_number == 12:
+            return first_day, date(year + 1, 1, 1)
+        return first_day, date(year, month_number + 1, 1)
     except ValueError:
+        # e.g. year 0000, which matches the pattern but is not a real date
         raise HTTPException(status_code=422, detail="month must use YYYY-MM")
 
-    next_month = (
-        date(month_start.year + 1, 1, 1)
-        if month_start.month == 12
-        else date(month_start.year, month_start.month + 1, 1)
-    )
-    start = max(month_start, date.fromisoformat(employee["joined_on"]))
-    pipeline = [
+
+# Small building blocks shared by the analytics pipelines. They only read
+# the stored values; nothing is recomputed from the punch times.
+
+# R6: these statuses count as being present.
+IS_PRESENT = {"$in": ["$status", list(PRESENCE_STATUSES)]}
+
+# R7: the record's date falls on Monday-Friday. `date` is stored as text,
+# so it is turned into a real date just to ask which day of the week it is.
+IS_WEEKDAY = {
+    "$lte": [
+        {"$isoDayOfWeek": {
+            "$dateFromString": {
+                "dateString": "$date",
+                "format": "%Y-%m-%d",
+                "onError": None,
+                "onNull": None,
+            }
+        }},
+        5,
+    ]
+}
+
+# R5: a half day is worth 0.5 of a present day. A missing half_day means false.
+PRESENT_DAY_VALUE = {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1]}
+
+IS_LATE = {"$gt": ["$late_minutes", 0]}
+
+
+def count_if(condition: dict) -> dict:
+    return {"$sum": {"$cond": [condition, 1, 0]}}
+
+
+def employee_monthly_pipeline(emp_code: str, month_start: date, next_month: date) -> list:
+    return [
         {"$match": {
             "emp_code": emp_code,
-            "date": {"$gte": start.isoformat(), "$lt": next_month.isoformat()},
+            "date": {"$gte": month_start.isoformat(), "$lt": next_month.isoformat()},
         }},
         {"$group": {
             "_id": None,
-            "days_present": {"$sum": 1},
-            "late_days": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
+            # Weekend records are left out of present_days,
+            # but still add to the late and overtime totals below.
+            "present_days": {"$sum": {
+                "$cond": [{"$and": [IS_PRESENT, IS_WEEKDAY]}, PRESENT_DAY_VALUE, 0]
+            }},
+            "leave_days": count_if({"$eq": ["$status", "LEAVE"]}),
+            "late_count": count_if(IS_LATE),
             "total_late_minutes": {"$sum": "$late_minutes"},
-            "total_work_hours": {"$sum": {"$ifNull": ["$work_hours", 0]}},
-            "total_overtime_hours": {"$sum": "$overtime_hours"},
-            "half_days": {"$sum": {"$cond": [{"$eq": ["$status", "half_day"]}, 1, 0]}},
+            "total_overtime_minutes": {"$sum": "$overtime_minutes"},
         }},
     ]
-    rows = list(attendance.aggregate(pipeline))
-    result = rows[0] if rows else {
-        "days_present": 0, "late_days": 0, "total_late_minutes": 0,
-        "total_work_hours": 0, "total_overtime_hours": 0, "half_days": 0,
-    }
-    result.pop("_id", None)
-    result["emp_code"] = emp_code
-    result["month"] = month
-    result["working_days_since_joining_in_month"] = working_days_between(
-        start, min(next_month - timedelta(days=1), now_utc().date())
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly_analytics(
+    emp_code: str,
+    month: str = Query(pattern=MONTH_PATTERN),
+):
+    employee = get_employee(emp_code)
+    month_start, next_month = month_bounds(month)
+    month_end = next_month - timedelta(days=1)
+
+    # R7: someone who joined mid-month is only expected from their joining day.
+    joined_on = date.fromisoformat(employee["joined_on"])
+    working_days = working_days_between(max(month_start, joined_on), month_end)
+
+    rows = list(
+        attendance.aggregate(employee_monthly_pipeline(emp_code, month_start, next_month))
     )
-    return result
+    totals = rows[0] if rows else {}
+    present_days = totals.get("present_days", 0)
+
+    attendance_pct = None
+    if working_days > 0:
+        attendance_pct = round_half_up(
+            Decimal(str(present_days)) * 100 / working_days
+        )
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": int(totals.get("leave_days", 0)),
+        "late_count": int(totals.get("late_count", 0)),
+        "total_late_minutes": int(totals.get("total_late_minutes", 0)),
+        "total_overtime_minutes": int(totals.get("total_overtime_minutes", 0)),
+        "attendance_pct": attendance_pct,
+    }
 
 
 # -------------------- DEPARTMENT SUMMARY --------------------
