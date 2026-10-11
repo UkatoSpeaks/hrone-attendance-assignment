@@ -346,7 +346,7 @@ class AttendanceCorrection(BaseModel):
 def health():
     try:
         client.admin.command("ping")
-        return {"status": "ok", "database": "connected"}
+        return {"status": "ok"}
     except PyMongoError:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
