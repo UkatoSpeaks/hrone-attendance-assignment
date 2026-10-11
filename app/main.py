@@ -823,39 +823,71 @@ def department_summary(
 
 # -------------------- LATE ARRIVAL LEADERBOARD --------------------
 
-@app.get("/analytics/leaderboard/late")
-def late_leaderboard(
-    month: str,
-    limit: int = Query(10, ge=1, le=100),
-):
-    try:
-        start = date.fromisoformat(f"{month}-01")
-    except ValueError:
-        raise HTTPException(status_code=422, detail="month must use YYYY-MM")
-    end = date(start.year + (start.month == 12), start.month % 12 + 1, 1)
-
+def late_leaderboard_pipeline(
+    month_start: date,
+    next_month: date,
+    limit: int,
+    department: Optional[str] = None,
+) -> list:
     pipeline = [
-        {"$match": {"date": {"$gte": start.isoformat(), "$lt": end.isoformat()}}},
+        # Only late records matter here, which also means anyone whose
+        # total would be 0 never appears.
+        {"$match": {
+            "date": {"$gte": month_start.isoformat(), "$lt": next_month.isoformat()},
+            "late_minutes": {"$gt": 0},
+        }},
         {"$group": {
             "_id": "$emp_code",
-            "late_days": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
             "total_late_minutes": {"$sum": "$late_minutes"},
+            "late_count": {"$sum": 1},
         }},
-        {"$sort": {"late_days": -1, "total_late_minutes": -1, "_id": 1}},
-        {
-    "$setWindowFields": {
-        "sortBy": {"late_days": -1},
-        "output": {
-            "rank": {"$rank": {}}
-        }
-    }
-},
-        {"$limit": limit},
+        {"$lookup": {
+            "from": employees.name,
+            "localField": "_id",
+            "foreignField": "emp_code",
+            "as": "employee",
+        }},
+        # Logs that belong to no known employee drop out here, before
+        # ranking, so they cannot take up a rank.
+        {"$unwind": "$employee"},
+    ]
+
+    # Filtering before the ranking step makes the ranks restart inside the department.
+    if department:
+        pipeline.append({"$match": {"employee.department": department}})
+
+    pipeline += [
+        # $rank is competition ranking: ties share a rank and the next
+        # one is skipped (1, 2, 2, 4).
+        {"$setWindowFields": {
+            "sortBy": {"total_late_minutes": -1},
+            "output": {"rank": {"$rank": {}}},
+        }},
+        # The limit is on the rank, not on the number of rows, so everyone
+        # tied at the cutoff is kept.
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
         {"$project": {
-            "_id": 0, "emp_code": "$_id", "late_days": 1,
-            "total_late_minutes": 1, "rank": 1,
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$employee.name",
+            "department": "$employee.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
         }},
     ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(pattern=MONTH_PATTERN),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    month_start, next_month = month_bounds(month)
+    pipeline = late_leaderboard_pipeline(month_start, next_month, limit, department)
     return {"month": month, "items": list(attendance.aggregate(pipeline))}
 
 
