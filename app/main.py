@@ -8,7 +8,7 @@ from typing import Annotated, Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
@@ -41,6 +41,9 @@ MAX_EPOCH_MS = 4_102_444_800_000
 LATE_GRACE_SECONDS = 10 * 60
 MIN_OVERTIME_MINUTES = 30
 HALF_DAY_BELOW_HOURS = 4.50
+MAX_PUNCH_SPAN = timedelta(hours=24)
+
+PRESENCE_STATUSES = ("PRESENT", "WFH", "ON_DUTY")
 
 
 # -------------------- STARTUP / INDEXES --------------------
@@ -55,6 +58,8 @@ def create_indexes():
         unique=True,
     )
     attendance.create_index([("date", ASCENDING)])
+    # Punch-out looks up an employee's latest punch-in.
+    attendance.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)])
 
 
 # -------------------- HELPERS --------------------
@@ -231,6 +236,16 @@ def calculate_attendance(
     }
 
 
+def validate_punch_out(punch_in: datetime, punch_out: datetime) -> None:
+    if punch_out <= punch_in:
+        raise HTTPException(status_code=422, detail="Punch-out must be after punch-in")
+    if punch_out - punch_in > MAX_PUNCH_SPAN:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out cannot be more than 24 hours after punch-in",
+        )
+
+
 def working_days_between(start: date, end: date) -> int:
     if start > end:
         return 0
@@ -293,16 +308,13 @@ class PunchOut(BaseModel):
 
 
 class AttendanceCorrection(BaseModel):
+    # Derived fields are not listed here, so if a client sends them
+    # they are simply ignored.
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
     punch_in: Optional[EpochMillis] = None
     punch_out: Optional[EpochMillis] = None
-    reason: str = Field(min_length=3, max_length=500)
+    reason: str = Field(min_length=5, max_length=200)
     regularized_by: str = Field(min_length=1, max_length=50)
-
-    @model_validator(mode="after")
-    def require_change(self):
-        if self.punch_in is None and self.punch_out is None:
-            raise ValueError("Provide punch_in and/or punch_out")
-        return self
 
 
 # -------------------- HEALTH --------------------
@@ -381,25 +393,33 @@ def punch_out(body: PunchOut):
     employee = get_employee(body.emp_code)
     punched_at = punch_instant(body.punched_at)
 
-    day = punched_at.astimezone(IST).date()
+    # Close the latest record that started at or before this punch. Finding it
+    # by punch time instead of by today's date is what makes overnight shifts
+    # work: their punch-out lands on the next calendar day.
     record = attendance.find_one(
-        {"emp_code": body.emp_code, "date": day.isoformat()}
+        {"emp_code": body.emp_code, "punch_in": {"$lte": punched_at}},
+        sort=[("punch_in", DESCENDING)],
     )
-    if not record or record.get("punch_in") is None:
+    if not record:
         raise HTTPException(status_code=404, detail="Punch-in record not found")
     if record.get("punch_out") is not None:
         raise HTTPException(status_code=409, detail="Already punched out")
-    if punched_at < record["punch_in"]:
-        raise HTTPException(status_code=422, detail="Punch-out cannot precede punch-in")
+    validate_punch_out(record["punch_in"], punched_at)
 
     metrics = calculate_attendance(
         employee, date.fromisoformat(record["date"]), record["punch_in"], punched_at
     )
-    attendance.update_one(
-        {"_id": record["_id"]},
+
+    # The filter repeats what we just read. If another request closed or
+    # corrected the record in the meantime, nothing matches and we lose the race.
+    updated = attendance.find_one_and_update(
+        {"_id": record["_id"], "punch_in": record["punch_in"], "punch_out": None},
         {"$set": {"punch_out": punched_at, **metrics}},
+        return_document=ReturnDocument.AFTER,
     )
-    return public_attendance(attendance.find_one({"_id": record["_id"]}))
+    if updated is None:
+        raise HTTPException(status_code=409, detail="Already punched out")
+    return public_attendance(updated)
 
 
 # -------------------- MANUAL CORRECTION --------------------
@@ -420,6 +440,7 @@ def correct_attendance(
 
     # What is stored now, with the defaults older records may be missing.
     before = {
+        "status": record.get("status"),
         "punch_in": record.get("punch_in"),
         "punch_out": record.get("punch_out"),
         "work_hours": record.get("work_hours"),
@@ -429,17 +450,44 @@ def correct_attendance(
     }
 
     after = dict(before)
-    if body.punch_in is not None:
-        after["punch_in"] = from_epoch_ms(body.punch_in)
-    if body.punch_out is not None:
-        after["punch_out"] = from_epoch_ms(body.punch_out)
+    if body.status is not None:
+        after["status"] = body.status
+    sent_punch_time = body.punch_in is not None or body.punch_out is not None
 
-    if (
-        after["punch_in"] is not None
-        and after["punch_out"] is not None
-        and after["punch_out"] < after["punch_in"]
-    ):
-        raise HTTPException(status_code=422, detail="Punch-out cannot precede punch-in")
+    if after["status"] in PRESENCE_STATUSES:
+        if body.punch_in is not None:
+            after["punch_in"] = from_epoch_ms(body.punch_in)
+        if body.punch_out is not None:
+            after["punch_out"] = from_epoch_ms(body.punch_out)
+
+        if after["punch_in"] is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Status {after['status']} needs a punch_in",
+            )
+        # A correction fixes the time of a day; it cannot move the record to another day.
+        if (
+            body.punch_in is not None
+            and attendance_date_for(employee, after["punch_in"]) != day
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="punch_in must stay on the record's attendance date",
+            )
+        if sent_punch_time and after["punch_out"] is not None:
+            validate_punch_out(after["punch_in"], after["punch_out"])
+    else:
+        # ABSENT and LEAVE mean nobody punched, so the times are wiped.
+        if sent_punch_time:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Status {after['status']} cannot have punch times",
+            )
+        after["punch_in"] = None
+        after["punch_out"] = None
+
+    if all(after[field] == before[field] for field in ("status", "punch_in", "punch_out")):
+        raise HTTPException(status_code=422, detail="The request changes nothing")
 
     after.update(
         calculate_attendance(employee, day, after["punch_in"], after["punch_out"])
@@ -457,8 +505,28 @@ def correct_attendance(
             if before[field] != after[field]
         },
     }
-    attendance.update_one(query, {"$set": after, "$push": {"history": entry}})
-    return public_attendance(attendance.find_one(query))
+
+    # Only write if the record is still exactly as we read it: same status and
+    # punches, and no history entry added since. Two people correcting the same
+    # day at once cannot overwrite each other; the slower one gets a 409.
+    history_length = len(record.get("history") or [])
+    updated = attendance.find_one_and_update(
+        {
+            **query,
+            "status": before["status"],
+            "punch_in": before["punch_in"],
+            "punch_out": before["punch_out"],
+            f"history.{history_length}": {"$exists": False},
+        },
+        {"$set": after, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The record was changed by someone else, please retry",
+        )
+    return public_attendance(updated)
 
 
 # -------------------- ATTENDANCE LIST --------------------
