@@ -57,7 +57,13 @@ def create_indexes():
         [("emp_code", ASCENDING), ("date", ASCENDING)],
         unique=True,
     )
-    attendance.create_index([("date", ASCENDING)])
+    # The attendance list is sorted by date (newest first), then emp_code.
+    # These two let MongoDB read rows already in that order, with or
+    # without a status filter, instead of sorting them itself.
+    attendance.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
+    attendance.create_index(
+        [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)]
+    )
     # Punch-out looks up an employee's latest punch-in.
     attendance.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)])
 
@@ -97,7 +103,10 @@ def round_half_up(value, places: int = 2) -> float:
 
 
 def parse_date(value: str) -> date:
+    # fromisoformat alone also accepts forms like "20260706", so check the shape first.
     try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError
         return date.fromisoformat(value)
     except (TypeError, ValueError):
         raise HTTPException(status_code=422, detail="Date must use YYYY-MM-DD")
@@ -296,6 +305,9 @@ EpochMillis = Annotated[
 ]
 
 
+AttendanceStatus = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+
+
 class PunchIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMillis] = None
@@ -310,7 +322,7 @@ class PunchOut(BaseModel):
 class AttendanceCorrection(BaseModel):
     # Derived fields are not listed here, so if a client sends them
     # they are simply ignored.
-    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    status: Optional[AttendanceStatus] = None
     punch_in: Optional[EpochMillis] = None
     punch_out: Optional[EpochMillis] = None
     reason: str = Field(min_length=5, max_length=200)
@@ -531,35 +543,61 @@ def correct_attendance(
 
 # -------------------- ATTENDANCE LIST --------------------
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    department: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
+ATTENDANCE_LIST_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+def attendance_list_query(
+    emp_code: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    status: Optional[str],
+) -> dict:
+    """Build the MongoDB filter for the attendance list from its query params."""
+    start = parse_date(date_from) if date_from else None
+    end = parse_date(date_to) if date_to else None
+    if start and end and start > end:
+        raise HTTPException(
+            status_code=422, detail="date_from cannot be after date_to"
+        )
+
     query = {}
     if emp_code:
         query["emp_code"] = emp_code
-    if department:
-        query["department"] = department
-    if date_from:
-        parse_date(date_from)
-        query.setdefault("date", {})["$gte"] = date_from
-    if date_to:
-        parse_date(date_to)
-        query.setdefault("date", {})["$lte"] = date_to
+    if status:
+        query["status"] = status
+    # Dates are stored as "YYYY-MM-DD" text, which sorts the same way as real dates.
+    if start:
+        query.setdefault("date", {})["$gte"] = start.isoformat()
+    if end:
+        query.setdefault("date", {})["$lte"] = end.isoformat()
+    return query
 
-    total = attendance.count_documents(query)
-    items = list(
-        attendance.find(query, {"_id": 0})
-        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[AttendanceStatus] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    query = attendance_list_query(emp_code, date_from, date_to, status)
+
+    # With no filter, the collection's own counter is instant;
+    # counting matches would walk every record.
+    if query:
+        total = attendance.count_documents(query)
+    else:
+        total = attendance.estimated_document_count()
+
+    cursor = (
+        attendance.find(query)
+        .sort(ATTENDANCE_LIST_SORT)
         .skip((page - 1) * page_size)
         .limit(page_size)
     )
-    items = [public_attendance(item) for item in items]
+    items = [public_attendance(doc) for doc in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
