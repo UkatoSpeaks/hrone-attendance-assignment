@@ -296,6 +296,9 @@ class EmployeeIn(BaseModel):
     @field_validator("joined_on")
     @classmethod
     def valid_joined_on(cls, value):
+        # fromisoformat alone also accepts forms like "20260105", so check the shape first.
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError("joined_on must use YYYY-MM-DD")
         date.fromisoformat(value)
         return value
 
