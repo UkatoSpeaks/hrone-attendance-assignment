@@ -3,7 +3,7 @@ import os
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -27,9 +27,20 @@ client = MongoClient(
 db = client[MONGO_DB]
 employees = db["employees"]
 attendance = db["attendance_logs"]
-audit_logs = db["audit_logs"]
 
 app = FastAPI(title="HROne Attendance & Analytics API", version="1.0.0")
+
+IST = timezone(timedelta(hours=5, minutes=30))
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+# Accepted range for epoch-millisecond timestamps.
+# Anything below the minimum looks like seconds, not milliseconds.
+MIN_EPOCH_MS = 100_000_000_000
+MAX_EPOCH_MS = 4_102_444_800_000
+
+LATE_GRACE_SECONDS = 10 * 60
+MIN_OVERTIME_MINUTES = 30
+HALF_DAY_BELOW_HOURS = 4.50
 
 
 # -------------------- STARTUP / INDEXES --------------------
@@ -44,8 +55,6 @@ def create_indexes():
         unique=True,
     )
     attendance.create_index([("date", ASCENDING)])
-    attendance.create_index([("department", ASCENDING), ("date", ASCENDING)])
-    audit_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)])
 
 
 # -------------------- HELPERS --------------------
@@ -54,24 +63,32 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 
-def to_epoch_ms(value: datetime) -> int:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return int(value.timestamp() * 1000)
-
-
-def from_epoch_ms(value: Optional[int]):
+def to_epoch_ms(value: Optional[datetime]) -> Optional[int]:
+    """Stored datetime -> epoch milliseconds, for API responses."""
     if value is None:
         return None
-    return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return (value - EPOCH) // timedelta(milliseconds=1)
 
 
-def round_hours(hours: float) -> float:
-    return float(
-        Decimal(str(hours)).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-    )
+def from_epoch_ms(value: Optional[int]) -> Optional[datetime]:
+    """Epoch milliseconds -> UTC datetime, cut down to the whole second (R1)."""
+    if value is None:
+        return None
+    return EPOCH + timedelta(seconds=value // 1000)
+
+
+def punch_instant(punched_at_ms: Optional[int]) -> datetime:
+    """The moment of a punch: what the client sent, or right now."""
+    if punched_at_ms is None:
+        return now_utc().replace(microsecond=0)
+    return from_epoch_ms(punched_at_ms)
+
+
+def round_half_up(value, places: int = 2) -> float:
+    step = Decimal(1).scaleb(-places)
+    return float(Decimal(str(value)).quantize(step, rounding=ROUND_HALF_UP))
 
 
 def parse_date(value: str) -> date:
@@ -81,12 +98,36 @@ def parse_date(value: str) -> date:
         raise HTTPException(status_code=422, detail="Date must use YYYY-MM-DD")
 
 
-def shift_datetime(day: date, shift: str) -> datetime:
-    hour, minute = map(int, shift.split(":"))
-    # Shift schedules are interpreted in IST.
-    from datetime import timezone as tz
-    ist = tz(timedelta(hours=5, minutes=30))
-    return datetime.combine(day, time(hour, minute), tzinfo=ist)
+def parse_shift_time(value: str) -> time:
+    hour, minute = map(int, value.split(":"))
+    return time(hour, minute)
+
+
+def is_overnight_shift(emp: dict) -> bool:
+    # "HH:MM" strings are zero-padded, so comparing them as text is safe.
+    return emp["shift_end"] <= emp["shift_start"]
+
+
+def attendance_date_for(emp: dict, punch_in: datetime) -> date:
+    """Which attendance day a punch-in belongs to (R1).
+
+    Normally it is the IST calendar date of the punch. On an overnight shift,
+    a punch that lands before the shift end (say 00:30 on a 22:00-06:00 shift)
+    still belongs to the shift that started the evening before.
+    """
+    local = punch_in.astimezone(IST)
+    if is_overnight_shift(emp) and local.time() < parse_shift_time(emp["shift_end"]):
+        return local.date() - timedelta(days=1)
+    return local.date()
+
+
+def shift_window(emp: dict, day: date) -> tuple[datetime, datetime]:
+    """Start and end of the employee's shift for one attendance day, in IST."""
+    start = datetime.combine(day, parse_shift_time(emp["shift_start"]), tzinfo=IST)
+    end = datetime.combine(day, parse_shift_time(emp["shift_end"]), tzinfo=IST)
+    if is_overnight_shift(emp):
+        end += timedelta(days=1)
+    return start, end
 
 
 def public_employee(doc: dict) -> dict:
@@ -96,9 +137,44 @@ def public_employee(doc: dict) -> dict:
     return doc
 
 
+def public_history_entry(entry: dict) -> dict:
+    changes = {}
+    for field, change in (entry.get("changes") or {}).items():
+        # Punch times sit inside the nested object as datetimes too.
+        if field in ("punch_in", "punch_out"):
+            change = {
+                "from": to_epoch_ms(change.get("from")),
+                "to": to_epoch_ms(change.get("to")),
+            }
+        changes[field] = change
+    return {
+        "at": to_epoch_ms(entry.get("at")),
+        "by": entry.get("by"),
+        "reason": entry.get("reason"),
+        "changes": changes,
+    }
+
+
 def public_attendance(doc: dict) -> dict:
-    doc.pop("_id", None)
-    return doc
+    """Stored attendance document -> API response shape.
+
+    Older seeded records may not have half_day or history at all, so every
+    optional field falls back to its default here.
+    """
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc.get("status"),
+        "punch_in": to_epoch_ms(doc.get("punch_in")),
+        "punch_out": to_epoch_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day")),
+        "history": [
+            public_history_entry(entry) for entry in doc.get("history") or []
+        ],
+    }
 
 
 def get_employee(emp_code: str) -> dict:
@@ -108,93 +184,51 @@ def get_employee(emp_code: str) -> dict:
     return employee
 
 
-
 def calculate_attendance(
     emp: dict,
-    punch_in_ms: int,
-    punch_out_ms: int | None = None,
+    day: date,
+    punch_in: Optional[datetime],
+    punch_out: Optional[datetime] = None,
 ) -> dict:
-    from datetime import datetime, timedelta, timezone
-    from decimal import Decimal, ROUND_HALF_UP
+    """Work out the derived fields for one attendance day (R2-R5).
 
-    IST = timezone(timedelta(hours=5, minutes=30))
-
-    def round2(value: float) -> float:
-        return float(
-            Decimal(str(value)).quantize(
-                Decimal("0.01"),
-                rounding=ROUND_HALF_UP,
-            )
-        )
-
-    # Convert epoch milliseconds to IST
-    punch_in_utc = datetime.fromtimestamp(
-        punch_in_ms / 1000, tz=timezone.utc
-    )
-    punch_in_ist = punch_in_utc.astimezone(IST)
-
-    # Shift times are interpreted in IST
-    shift_start_time = datetime.strptime(
-        emp["shift_start"], "%H:%M"
-    ).time()
-    shift_end_time = datetime.strptime(
-        emp["shift_end"], "%H:%M"
-    ).time()
-
-    shift_start = datetime.combine(
-        punch_in_ist.date(), shift_start_time, tzinfo=IST
-    )
-    shift_end = datetime.combine(
-        punch_in_ist.date(), shift_end_time, tzinfo=IST
-    )
-
-    # Handle overnight shifts
-    if shift_end <= shift_start:
-        shift_end += timedelta(days=1)
-
-    late_minutes = max(
-        0,
-        int((punch_in_ist - shift_start).total_seconds() // 60),
-    )
-
-    # Ten-minute grace applies to late classification.
-    is_late = late_minutes > 10
-
+    `day` is the attendance date, not the date of the punch, so an overnight
+    shift is always measured against the shift it actually belongs to.
+    """
+    late_minutes = 0
     work_hours = None
     overtime_minutes = 0
     half_day = False
 
-    if punch_out_ms is not None:
-        punch_out_utc = datetime.fromtimestamp(
-            punch_out_ms / 1000, tz=timezone.utc
-        )
-        punch_out_ist = punch_out_utc.astimezone(IST)
+    # ABSENT / LEAVE records have no punches, so there is nothing to compute.
+    if punch_in is not None:
+        shift_start, shift_end = shift_window(emp, day)
 
-        # If the punch-in belongs to an overnight shift,
-        # the shift end is already on the following day.
-        elapsed_seconds = max(
-            0,
-            (punch_out_ist - punch_in_ist).total_seconds(),
-        )
-        work_hours = round2(elapsed_seconds / 3600)
+        # R2: late only when strictly more than 10:00 past shift start,
+        # and then the minutes count from shift start, not from the grace end.
+        seconds_after_start = int((punch_in - shift_start).total_seconds())
+        if seconds_after_start > LATE_GRACE_SECONDS:
+            late_minutes = seconds_after_start // 60
 
-        overtime_seconds = max(
-            0,
-            (punch_out_ist - shift_end).total_seconds(),
-        )
-        if overtime_seconds >= 30 * 60:
-            overtime_minutes = int(overtime_seconds // 60)
+        if punch_out is not None:
+            # R4: hours worked, rounded half-up to 2 decimals.
+            worked_seconds = int((punch_out - punch_in).total_seconds())
+            work_hours = round_half_up(Decimal(worked_seconds) / Decimal(3600))
 
-        half_day = work_hours < 4.50
+            # R3: overtime only counts once it reaches 30 whole minutes.
+            minutes_after_end = int((punch_out - shift_end).total_seconds()) // 60
+            if minutes_after_end >= MIN_OVERTIME_MINUTES:
+                overtime_minutes = minutes_after_end
+
+            # R5: decided on the rounded hours.
+            half_day = work_hours < HALF_DAY_BELOW_HOURS
 
     return {
         "late_minutes": late_minutes,
-        "is_late": is_late,
         "work_hours": work_hours,
         "overtime_minutes": overtime_minutes,
         "half_day": half_day,
     }
-
 
 
 def working_days_between(start: date, end: date) -> int:
@@ -240,20 +274,29 @@ class EmployeeIn(BaseModel):
         return self
 
 
+# A point in time sent by a client: a whole number of milliseconds.
+# strict=True rejects strings, floats and booleans with a 422.
+EpochMillis = Annotated[
+    int, Field(strict=True, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)
+]
+
+
 class PunchIn(BaseModel):
     emp_code: str
-    punched_at: Optional[datetime] = None
+    punched_at: Optional[EpochMillis] = None
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 class PunchOut(BaseModel):
     emp_code: str
-    punched_at: Optional[datetime] = None
+    punched_at: Optional[EpochMillis] = None
 
 
 class AttendanceCorrection(BaseModel):
-    punch_in: Optional[int] = None
-    punch_out: Optional[int] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
     reason: str = Field(min_length=3, max_length=500)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
     @model_validator(mode="after")
     def require_change(self):
@@ -308,26 +351,21 @@ def list_employees(
 
 # -------------------- PUNCH IN / OUT --------------------
 
-@app.post("/attendance/punch-in")
+@app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchIn):
     employee = get_employee(body.emp_code)
-    punched_at = body.punched_at or now_utc()
-    if punched_at.tzinfo is None:
-        punched_at = punched_at.replace(tzinfo=timezone.utc)
-
-    day = punched_at.astimezone(
-        timezone(timedelta(hours=5, minutes=30))
-    ).date()
-    timestamp = to_epoch_ms(punched_at)
+    punched_at = punch_instant(body.punched_at)
+    day = attendance_date_for(employee, punched_at)
 
     record = {
         "emp_code": body.emp_code,
-        "department": employee["department"],
         "date": day.isoformat(),
-        "punch_in": timestamp,
+        "status": body.status,
+        "punch_in": punched_at,
         "punch_out": None,
+        **calculate_attendance(employee, day, punched_at),
+        "history": [],
     }
-    record.update(calculate_attendance(employee, day, timestamp, None))
 
     try:
         attendance.insert_one(record)
@@ -341,34 +379,27 @@ def punch_in(body: PunchIn):
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOut):
     employee = get_employee(body.emp_code)
-    punched_at = body.punched_at or now_utc()
-    if punched_at.tzinfo is None:
-        punched_at = punched_at.replace(tzinfo=timezone.utc)
+    punched_at = punch_instant(body.punched_at)
 
-    day = punched_at.astimezone(
-        timezone(timedelta(hours=5, minutes=30))
-    ).date()
+    day = punched_at.astimezone(IST).date()
     record = attendance.find_one(
         {"emp_code": body.emp_code, "date": day.isoformat()}
     )
-    if not record:
+    if not record or record.get("punch_in") is None:
         raise HTTPException(status_code=404, detail="Punch-in record not found")
     if record.get("punch_out") is not None:
         raise HTTPException(status_code=409, detail="Already punched out")
-
-    timestamp = to_epoch_ms(punched_at)
-    if timestamp < record["punch_in"]:
+    if punched_at < record["punch_in"]:
         raise HTTPException(status_code=422, detail="Punch-out cannot precede punch-in")
 
     metrics = calculate_attendance(
-        employee, day, record["punch_in"], timestamp
+        employee, date.fromisoformat(record["date"]), record["punch_in"], punched_at
     )
     attendance.update_one(
         {"_id": record["_id"]},
-        {"$set": {"punch_out": timestamp, **metrics}},
+        {"$set": {"punch_out": punched_at, **metrics}},
     )
-    updated = attendance.find_one({"_id": record["_id"]}, {"_id": 0})
-    return updated
+    return public_attendance(attendance.find_one({"_id": record["_id"]}))
 
 
 # -------------------- MANUAL CORRECTION --------------------
@@ -387,28 +418,47 @@ def correct_attendance(
     if not record:
         raise HTTPException(status_code=404, detail="Attendance record not found")
 
-    new_in = body.punch_in if body.punch_in is not None else record["punch_in"]
-    new_out = body.punch_out if body.punch_out is not None else record.get("punch_out")
+    # What is stored now, with the defaults older records may be missing.
+    before = {
+        "punch_in": record.get("punch_in"),
+        "punch_out": record.get("punch_out"),
+        "work_hours": record.get("work_hours"),
+        "late_minutes": record.get("late_minutes") or 0,
+        "overtime_minutes": record.get("overtime_minutes") or 0,
+        "half_day": bool(record.get("half_day")),
+    }
 
-    if new_out is not None and new_out < new_in:
+    after = dict(before)
+    if body.punch_in is not None:
+        after["punch_in"] = from_epoch_ms(body.punch_in)
+    if body.punch_out is not None:
+        after["punch_out"] = from_epoch_ms(body.punch_out)
+
+    if (
+        after["punch_in"] is not None
+        and after["punch_out"] is not None
+        and after["punch_out"] < after["punch_in"]
+    ):
         raise HTTPException(status_code=422, detail="Punch-out cannot precede punch-in")
 
-    metrics = calculate_attendance(employee, day, new_in, new_out)
-    changes = {"punch_in": new_in, "punch_out": new_out, **metrics}
+    after.update(
+        calculate_attendance(employee, day, after["punch_in"], after["punch_out"])
+    )
 
-    audit_logs.insert_one({
-        "emp_code": emp_code,
-        "date": day.isoformat(),
+    # The audit trail lives on the record itself: one entry per correction,
+    # listing only the fields whose value really changed.
+    entry = {
+        "at": now_utc().replace(microsecond=0),
+        "by": body.regularized_by,
         "reason": body.reason,
-        "before": {
-            "punch_in": record.get("punch_in"),
-            "punch_out": record.get("punch_out"),
+        "changes": {
+            field: {"from": before[field], "to": after[field]}
+            for field in before
+            if before[field] != after[field]
         },
-        "after": {"punch_in": new_in, "punch_out": new_out},
-        "corrected_at": now_utc(),
-    })
-    attendance.update_one(query, {"$set": changes})
-    return attendance.find_one(query, {"_id": 0})
+    }
+    attendance.update_one(query, {"$set": after, "$push": {"history": entry}})
+    return public_attendance(attendance.find_one(query))
 
 
 # -------------------- ATTENDANCE LIST --------------------
@@ -441,6 +491,7 @@ def list_attendance(
         .skip((page - 1) * page_size)
         .limit(page_size)
     )
+    items = [public_attendance(item) for item in items]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
