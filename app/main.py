@@ -37,8 +37,7 @@ app = FastAPI(title="HROne Attendance & Analytics API", version="1.0.0")
 IST = timezone(timedelta(hours=5, minutes=30))
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-# Accepted range for epoch-millisecond timestamps.
-# Anything below the minimum looks like seconds, not milliseconds.
+# anything below the minimum is seconds, not milliseconds
 MIN_EPOCH_MS = 100_000_000_000
 MAX_EPOCH_MS = 4_102_444_800_000
 
@@ -56,23 +55,19 @@ PRESENCE_STATUSES = ("PRESENT", "WFH", "ON_DUTY")
 def create_indexes():
     client.admin.command("ping")
     employees.create_index([("emp_code", ASCENDING)], unique=True)
-    # Employee list filtered by department, already in emp_code order.
     employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
-    # Headcount: who had joined by a given day, overall or in one department.
     employees.create_index([("joined_on", ASCENDING)])
     employees.create_index([("department", ASCENDING), ("joined_on", ASCENDING)])
     attendance.create_index(
         [("emp_code", ASCENDING), ("date", ASCENDING)],
         unique=True,
     )
-    # The attendance list is sorted by date (newest first), then emp_code.
-    # These two let MongoDB read rows already in that order, with or
-    # without a status filter, instead of sorting them itself.
+    # same order as the attendance list sort, so no in-memory sort
     attendance.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
     attendance.create_index(
         [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)]
     )
-    # Punch-out looks up an employee's latest punch-in.
+    # punch-out: latest punch-in of an employee
     attendance.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)])
 
 
@@ -83,7 +78,6 @@ def now_utc():
 
 
 def to_epoch_ms(value: Optional[datetime]) -> Optional[int]:
-    """Stored datetime -> epoch milliseconds, for API responses."""
     if value is None:
         return None
     if value.tzinfo is None:
@@ -92,14 +86,13 @@ def to_epoch_ms(value: Optional[datetime]) -> Optional[int]:
 
 
 def from_epoch_ms(value: Optional[int]) -> Optional[datetime]:
-    """Epoch milliseconds -> UTC datetime, cut down to the whole second (R1)."""
+    # R1: milliseconds are dropped here
     if value is None:
         return None
     return EPOCH + timedelta(seconds=value // 1000)
 
 
 def punch_instant(punched_at_ms: Optional[int]) -> datetime:
-    """The moment of a punch: what the client sent, or right now."""
     if punched_at_ms is None:
         return now_utc().replace(microsecond=0)
     return from_epoch_ms(punched_at_ms)
@@ -131,12 +124,8 @@ def is_overnight_shift(emp: dict) -> bool:
 
 
 def attendance_date_for(emp: dict, punch_in: datetime) -> date:
-    """Which attendance day a punch-in belongs to (R1).
-
-    Normally it is the IST calendar date of the punch. On an overnight shift,
-    a punch that lands before the shift end (say 00:30 on a 22:00-06:00 shift)
-    still belongs to the shift that started the evening before.
-    """
+    # R1: on an overnight shift, a punch before shift_end (e.g. 00:30 on
+    # 22:00-06:00) belongs to the shift that started the previous day
     local = punch_in.astimezone(IST)
     if is_overnight_shift(emp) and local.time() < parse_shift_time(emp["shift_end"]):
         return local.date() - timedelta(days=1)
@@ -144,7 +133,6 @@ def attendance_date_for(emp: dict, punch_in: datetime) -> date:
 
 
 def shift_window(emp: dict, day: date) -> tuple[datetime, datetime]:
-    """Start and end of the employee's shift for one attendance day, in IST."""
     start = datetime.combine(day, parse_shift_time(emp["shift_start"]), tzinfo=IST)
     end = datetime.combine(day, parse_shift_time(emp["shift_end"]), tzinfo=IST)
     if is_overnight_shift(emp):
@@ -162,7 +150,7 @@ def public_employee(doc: dict) -> dict:
 def public_history_entry(entry: dict) -> dict:
     changes = {}
     for field, change in (entry.get("changes") or {}).items():
-        # Punch times sit inside the nested object as datetimes too.
+        # punch times inside changes are datetimes too
         if field in ("punch_in", "punch_out"):
             change = {
                 "from": to_epoch_ms(change.get("from")),
@@ -178,11 +166,7 @@ def public_history_entry(entry: dict) -> dict:
 
 
 def public_attendance(doc: dict) -> dict:
-    """Stored attendance document -> API response shape.
-
-    Older seeded records may not have half_day or history at all, so every
-    optional field falls back to its default here.
-    """
+    # old seeded records may not have half_day or history
     return {
         "emp_code": doc["emp_code"],
         "date": doc["date"],
@@ -212,37 +196,29 @@ def calculate_attendance(
     punch_in: Optional[datetime],
     punch_out: Optional[datetime] = None,
 ) -> dict:
-    """Work out the derived fields for one attendance day (R2-R5).
-
-    `day` is the attendance date, not the date of the punch, so an overnight
-    shift is always measured against the shift it actually belongs to.
-    """
+    # day is the attendance date, not the date of the punch (overnight shifts)
     late_minutes = 0
     work_hours = None
     overtime_minutes = 0
     half_day = False
 
-    # ABSENT / LEAVE records have no punches, so there is nothing to compute.
     if punch_in is not None:
         shift_start, shift_end = shift_window(emp, day)
 
-        # R2: late only when strictly more than 10:00 past shift start,
-        # and then the minutes count from shift start, not from the grace end.
+        # R2: grace is checked in seconds, minutes count from shift start
         seconds_after_start = int((punch_in - shift_start).total_seconds())
         if seconds_after_start > LATE_GRACE_SECONDS:
             late_minutes = seconds_after_start // 60
 
         if punch_out is not None:
-            # R4: hours worked, rounded half-up to 2 decimals.
             worked_seconds = int((punch_out - punch_in).total_seconds())
             work_hours = round_half_up(Decimal(worked_seconds) / Decimal(3600))
 
-            # R3: overtime only counts once it reaches 30 whole minutes.
             minutes_after_end = int((punch_out - shift_end).total_seconds()) // 60
             if minutes_after_end >= MIN_OVERTIME_MINUTES:
                 overtime_minutes = minutes_after_end
 
-            # R5: decided on the rounded hours.
+            # R5 uses the rounded hours
             half_day = work_hours < HALF_DAY_BELOW_HOURS
 
     return {
@@ -296,7 +272,6 @@ class EmployeeIn(BaseModel):
     @field_validator("joined_on")
     @classmethod
     def valid_joined_on(cls, value):
-        # fromisoformat alone also accepts forms like "20260105", so check the shape first.
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
             raise ValueError("joined_on must use YYYY-MM-DD")
         date.fromisoformat(value)
@@ -309,8 +284,7 @@ class EmployeeIn(BaseModel):
         return self
 
 
-# A point in time sent by a client: a whole number of milliseconds.
-# strict=True rejects strings, floats and booleans with a 422.
+# strict=True so strings, floats and booleans are a 422
 EpochMillis = Annotated[
     int, Field(strict=True, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)
 ]
@@ -331,8 +305,7 @@ class PunchOut(BaseModel):
 
 
 class AttendanceCorrection(BaseModel):
-    # Derived fields are not listed here, so if a client sends them
-    # they are simply ignored.
+    # derived fields are not listed, so they are ignored if sent
     status: Optional[AttendanceStatus] = None
     punch_in: Optional[EpochMillis] = None
     punch_out: Optional[EpochMillis] = None
@@ -416,9 +389,7 @@ def punch_out(body: PunchOut):
     employee = get_employee(body.emp_code)
     punched_at = punch_instant(body.punched_at)
 
-    # Close the latest record that started at or before this punch. Finding it
-    # by punch time instead of by today's date is what makes overnight shifts
-    # work: their punch-out lands on the next calendar day.
+    # looked up by punch time, not by date, so overnight shifts work
     record = attendance.find_one(
         {"emp_code": body.emp_code, "punch_in": {"$lte": punched_at}},
         sort=[("punch_in", DESCENDING)],
@@ -433,8 +404,7 @@ def punch_out(body: PunchOut):
         employee, date.fromisoformat(record["date"]), record["punch_in"], punched_at
     )
 
-    # The filter repeats what we just read. If another request closed or
-    # corrected the record in the meantime, nothing matches and we lose the race.
+    # if another request closed the record in between, nothing matches -> 409
     updated = attendance.find_one_and_update(
         {"_id": record["_id"], "punch_in": record["punch_in"], "punch_out": None},
         {"$set": {"punch_out": punched_at, **metrics}},
@@ -461,7 +431,6 @@ def correct_attendance(
     if not record:
         raise HTTPException(status_code=404, detail="Attendance record not found")
 
-    # What is stored now, with the defaults older records may be missing.
     before = {
         "status": record.get("status"),
         "punch_in": record.get("punch_in"),
@@ -488,7 +457,6 @@ def correct_attendance(
                 status_code=422,
                 detail=f"Status {after['status']} needs a punch_in",
             )
-        # A correction fixes the time of a day; it cannot move the record to another day.
         if (
             body.punch_in is not None
             and attendance_date_for(employee, after["punch_in"]) != day
@@ -500,7 +468,7 @@ def correct_attendance(
         if sent_punch_time and after["punch_out"] is not None:
             validate_punch_out(after["punch_in"], after["punch_out"])
     else:
-        # ABSENT and LEAVE mean nobody punched, so the times are wiped.
+        # ABSENT / LEAVE: punch times are cleared
         if sent_punch_time:
             raise HTTPException(
                 status_code=422,
@@ -516,8 +484,6 @@ def correct_attendance(
         calculate_attendance(employee, day, after["punch_in"], after["punch_out"])
     )
 
-    # The audit trail lives on the record itself: one entry per correction,
-    # listing only the fields whose value really changed.
     entry = {
         "at": now_utc().replace(microsecond=0),
         "by": body.regularized_by,
@@ -529,9 +495,8 @@ def correct_attendance(
         },
     }
 
-    # Only write if the record is still exactly as we read it: same status and
-    # punches, and no history entry added since. Two people correcting the same
-    # day at once cannot overwrite each other; the slower one gets a 409.
+    # write only if the record is unchanged since we read it (same values,
+    # no new history entry); otherwise the slower request gets a 409
     history_length = len(record.get("history") or [])
     updated = attendance.find_one_and_update(
         {
@@ -563,7 +528,6 @@ def attendance_list_query(
     date_to: Optional[str],
     status: Optional[str],
 ) -> dict:
-    """Build the MongoDB filter for the attendance list from its query params."""
     start = parse_date(date_from) if date_from else None
     end = parse_date(date_to) if date_to else None
     if start and end and start > end:
@@ -576,7 +540,7 @@ def attendance_list_query(
         query["emp_code"] = emp_code
     if status:
         query["status"] = status
-    # Dates are stored as "YYYY-MM-DD" text, which sorts the same way as real dates.
+    # dates are "YYYY-MM-DD" text, which compares the same way as real dates
     if start:
         query.setdefault("date", {})["$gte"] = start.isoformat()
     if end:
@@ -595,8 +559,7 @@ def list_attendance(
 ):
     query = attendance_list_query(emp_code, date_from, date_to, status)
 
-    # With no filter, the collection's own counter is instant;
-    # counting matches would walk every record.
+    # no filter: use the collection's counter instead of walking every record
     if query:
         total = attendance.count_documents(query)
     else:
@@ -618,7 +581,7 @@ MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
 
 
 def month_bounds(month: str) -> tuple[date, date]:
-    """First day of the month and first day of the month after it."""
+    # returns (first day of the month, first day of the next month)
     try:
         year, month_number = map(int, month.split("-"))
         first_day = date(year, month_number, 1)
@@ -630,14 +593,11 @@ def month_bounds(month: str) -> tuple[date, date]:
         raise HTTPException(status_code=422, detail="month must use YYYY-MM")
 
 
-# Small building blocks shared by the analytics pipelines. They only read
-# the stored values; nothing is recomputed from the punch times.
+# shared pieces for the analytics pipelines
 
-# R6: these statuses count as being present.
 IS_PRESENT = {"$in": ["$status", list(PRESENCE_STATUSES)]}
 
-# R7: the record's date falls on Monday-Friday. `date` is stored as text,
-# so it is turned into a real date just to ask which day of the week it is.
+# R7: Mon-Fri. date is stored as text, so convert it to get the weekday
 IS_WEEKDAY = {
     "$lte": [
         {"$isoDayOfWeek": {
@@ -652,7 +612,7 @@ IS_WEEKDAY = {
     ]
 }
 
-# R5: a half day is worth 0.5 of a present day. A missing half_day means false.
+# R5: half day = 0.5 (missing half_day means false)
 PRESENT_DAY_VALUE = {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1]}
 
 IS_LATE = {"$gt": ["$late_minutes", 0]}
@@ -670,8 +630,7 @@ def employee_monthly_pipeline(emp_code: str, month_start: date, next_month: date
         }},
         {"$group": {
             "_id": None,
-            # Weekend records are left out of present_days,
-            # but still add to the late and overtime totals below.
+            # weekend records don't count here but still add to late/overtime
             "present_days": {"$sum": {
                 "$cond": [{"$and": [IS_PRESENT, IS_WEEKDAY]}, PRESENT_DAY_VALUE, 0]
             }},
@@ -692,7 +651,7 @@ def employee_monthly_analytics(
     month_start, next_month = month_bounds(month)
     month_end = next_month - timedelta(days=1)
 
-    # R7: someone who joined mid-month is only expected from their joining day.
+    # R7: mid-month joiners are counted from joined_on
     joined_on = date.fromisoformat(employee["joined_on"])
     working_days = working_days_between(max(month_start, joined_on), month_end)
 
@@ -728,20 +687,15 @@ def department_summary_pipeline(
     next_month: date,
     department: Optional[str] = None,
 ) -> list:
-    """Runs on `employees`, not on the logs.
-
-    Starting from the employees is what keeps people with zero logs in the
-    headcount: every employee produces a row, and their month of logs (possibly
-    none) is attached to it.
-    """
+    # runs on employees (not on the logs) so people with zero logs
+    # still count in the headcount
     month_end = next_month - timedelta(days=1)
 
-    # R9: everyone who had joined by the last day of the month.
+    # R9: joined on or before the last day of the month
     employee_filter = {"joined_on": {"$lte": month_end.isoformat()}}
     if department:
         employee_filter["department"] = department
 
-    # The average only looks at present records that have hours recorded.
     has_work_hours = {"$and": [IS_PRESENT, {"$isNumber": "$work_hours"}]}
 
     one_employee_month = [
@@ -753,8 +707,7 @@ def department_summary_pipeline(
             "present_days": {"$sum": {
                 "$cond": [{"$and": [IS_PRESENT, IS_WEEKDAY]}, PRESENT_DAY_VALUE, 0]
             }},
-            # Hours are added up as exact decimals, so the average is not
-            # thrown off by floating-point error before it gets rounded.
+            # summed as decimals to avoid float error before rounding
             "work_hours_total": {"$sum": {
                 "$cond": [has_work_hours, {"$toDecimal": "$work_hours"}, 0]
             }},
@@ -775,14 +728,14 @@ def department_summary_pipeline(
             "pipeline": one_employee_month,
             "as": "logs",
         }},
-        # Keep the employee even when the lookup found nothing.
+        # keep the employee even when there are no logs
         {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
         {"$group": {
             "_id": "$department",
             "headcount": {"$sum": 1},
             "present_days": {"$sum": "$logs.present_days"},
-            # Totals and record counts are summed across the department, so the
-            # average is over records, not an average of each person's average.
+            # total and count kept separately: average over records,
+            # not an average of averages
             "work_hours_total": {"$sum": "$logs.work_hours_total"},
             "work_hours_records": {"$sum": "$logs.work_hours_records"},
             "late_count": {"$sum": "$logs.late_count"},
@@ -835,8 +788,6 @@ def late_leaderboard_pipeline(
     department: Optional[str] = None,
 ) -> list:
     pipeline = [
-        # Only late records matter here, which also means anyone whose
-        # total would be 0 never appears.
         {"$match": {
             "date": {"$gte": month_start.isoformat(), "$lt": next_month.isoformat()},
             "late_minutes": {"$gt": 0},
@@ -852,24 +803,21 @@ def late_leaderboard_pipeline(
             "foreignField": "emp_code",
             "as": "employee",
         }},
-        # Logs that belong to no known employee drop out here, before
-        # ranking, so they cannot take up a rank.
+        # logs with no matching employee drop out here, before ranking
         {"$unwind": "$employee"},
     ]
 
-    # Filtering before the ranking step makes the ranks restart inside the department.
+    # filter before ranking, so ranks are inside the department
     if department:
         pipeline.append({"$match": {"employee.department": department}})
 
     pipeline += [
-        # $rank is competition ranking: ties share a rank and the next
-        # one is skipped (1, 2, 2, 4).
+        # $rank gives 1, 2, 2, 4 for ties
         {"$setWindowFields": {
             "sortBy": {"total_late_minutes": -1},
             "output": {"rank": {"$rank": {}}},
         }},
-        # The limit is on the rank, not on the number of rows, so everyone
-        # tied at the cutoff is kept.
+        # limit is on rank, not row count, so ties at the cutoff are kept
         {"$match": {"rank": {"$lte": limit}}},
         {"$sort": {"total_late_minutes": -1, "_id": 1}},
         {"$project": {
@@ -900,18 +848,13 @@ def late_leaderboard(
 
 MAX_TREND_DAYS = 92
 
-# Rates are worked out as whole ten-thousandths (0.3333 is kept as 3333),
-# so rounding to 4 decimals is exact integer arithmetic.
+# rates are kept as whole ten-thousandths (0.3333 -> 3333) until the end
 RATE_SCALE = 10000
 
 
 def rounded_division(numerator, denominator) -> dict:
-    """numerator / denominator, rounded half-up to a whole number, inside MongoDB.
-
-    MongoDB's own $round sends halves to the nearest even number, which is not
-    what R8 asks for. floor((2n + d) / 2d) gives half-up, and stays exact
-    because both sides are whole numbers.
-    """
+    # MongoDB's $round is half-to-even, R8 wants half-up:
+    # floor((2n + d) / 2d)
     return {"$floor": {"$divide": [
         {"$add": [{"$multiply": [2, numerator]}, denominator]},
         {"$multiply": [2, denominator]},
@@ -919,13 +862,9 @@ def rounded_division(numerator, denominator) -> dict:
 
 
 def department_trend_pipeline(department: str, start: date, end: date) -> list:
-    """Runs on `employees`: the department lives there, not on the logs.
-
-    Every employee is turned into a handful of small "events" (they joined on
-    this day, they were present on that day, ...). Grouping the events by day
-    gives the days that have something on them; $densify then adds the days
-    that have nothing, so there is exactly one row per calendar day.
-    """
+    # runs on employees, since the department lives there. Each employee
+    # becomes a list of per-day events (joined, present, late); these are
+    # grouped by day and $densify fills the days with nothing on them.
     first_day = start.isoformat()
     last_day = end.isoformat()
 
@@ -934,14 +873,13 @@ def department_trend_pipeline(department: str, start: date, end: date) -> list:
         {"$project": {
             "_id": 0,
             "day": "$date",
-            # Any day of the week counts here, weekends included.
             "present": {"$cond": [IS_PRESENT, PRESENT_DAY_VALUE, 0]},
             "late": {"$cond": [IS_LATE, 1, 0]},
         }},
     ]
 
-    # Someone who joined before the range is counted from its first day;
-    # someone who joins after the range is not counted at all (R9).
+    # R9: joined before the range -> counted from its first day,
+    # joined after the range -> not counted
     join_event = {"$cond": [
         {"$lte": ["$joined_on", last_day]},
         [{"day": {"$max": ["$joined_on", first_day]}, "joined": 1}],
@@ -959,8 +897,7 @@ def department_trend_pipeline(department: str, start: date, end: date) -> list:
         }},
         {"$project": {
             "events": {"$concatArrays": [
-                # Two empty events pin down both ends of the range, so the
-                # gap filling below always covers first_day..last_day.
+                # empty events on both ends so $densify covers the full range
                 [{"day": first_day}, {"day": last_day}],
                 join_event,
                 "$logs",
@@ -973,13 +910,13 @@ def department_trend_pipeline(department: str, start: date, end: date) -> list:
             "present_count": {"$sum": "$events.present"},
             "late_count": {"$sum": "$events.late"},
         }},
-        # $densify needs a real date, not the "YYYY-MM-DD" text.
+        # $densify needs a real date, not text
         {"$set": {"day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d"}}}},
         {"$densify": {
             "field": "day",
             "range": {"step": 1, "unit": "day", "bounds": "full"},
         }},
-        # Headcount on a day = everyone who has joined up to and including that day.
+        # headcount = running total of joiners up to that day
         {"$setWindowFields": {
             "sortBy": {"day": 1},
             "output": {
@@ -991,13 +928,12 @@ def department_trend_pipeline(department: str, start: date, end: date) -> list:
         }},
         {"$set": {
             "is_working_day": {"$lte": [{"$isoDayOfWeek": "$day"}, 5]},
-            # Days added by $densify have no counts yet.
+            # days added by $densify have no counts
             "present_count": {"$ifNull": ["$present_count", 0]},
             "late_count": {"$ifNull": ["$late_count", 0]},
         }},
         {"$set": {
-            # Only a working day with people on the books has a rate.
-            # A working day nobody showed up on is 0, not null.
+            # null on weekends or with no headcount; an empty working day is 0
             "rate": {"$cond": [
                 {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
                 rounded_division(
@@ -1006,9 +942,7 @@ def department_trend_pipeline(department: str, start: date, end: date) -> list:
                 None,
             ]},
         }},
-        # 7-day moving average: this row and up to 6 rows before it. The window
-        # counts rows, so weekends take up a slot but add nothing, and the
-        # first rows of the range simply have fewer rows to look back on.
+        # this row and up to 6 rows before it; null rates are skipped
         {"$setWindowFields": {
             "sortBy": {"day": 1},
             "output": {
@@ -1064,8 +998,7 @@ def department_trend(
     items = list(
         employees.aggregate(department_trend_pipeline(department, start, end))
     )
-    # The pipeline starts from the department's employees, so it only comes
-    # back empty when the department has none.
+    # empty only when the department has no employees
     if not items:
         raise HTTPException(status_code=404, detail="Department not found")
     return {"department": department, "items": items}
@@ -1103,8 +1036,7 @@ def explain_endpoint(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    # Nothing is rebuilt by hand here. Every branch calls the same function
-    # the real endpoint calls, so the plan we show is the plan it really gets.
+    # each branch uses the same builder as the real endpoint
     if endpoint == "attendance_list":
         collection = attendance
         command = {
@@ -1140,8 +1072,7 @@ def explain_endpoint(
 
     plan = db.command("explain", command, verbosity="executionStats")
 
-    # The plan carries a few MongoDB-only types (timestamps, binary ids)
-    # that plain JSON can't hold, so let bson write it out first.
+    # the plan has BSON types (timestamps, binary) that plain JSON can't hold
     return {
         "endpoint": endpoint,
         "collection": collection.name,
